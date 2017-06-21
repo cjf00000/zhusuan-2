@@ -77,8 +77,8 @@ def classifier(x, n_y, is_training):
                          normalizer_fn=layers.batch_norm,
                          normalizer_params=normalizer_params)
     lc_x = layers.flatten(lc_x)
-
-    # ==================== VGG ======================
+#
+#    # ==================== VGG ======================
 #    # 32 * 32 * 96
 #    lc_x = layers.conv2d(x, 96, 3,
 #                         normalizer_fn=layers.batch_norm,
@@ -135,6 +135,7 @@ def classifier(x, n_y, is_training):
 
     # 192
     lc_x = minibatch_discrimination(lc_x)
+    lc_x = layers.batch_norm(lc_x, is_training=is_training, updates_collections=None)
     print(lc_x.get_shape())
     # 292
     class_logits = layers.fully_connected(lc_x, n_y, activation_fn=None)
@@ -167,6 +168,16 @@ class BatchGenerator():
             self.cnt = next_cnt
         return self.x[prev_cnt:next_cnt], self.y[prev_cnt:next_cnt]
 
+    def batches(self):
+        ret = []
+        bs = self.bs
+        for i in range(self.x.shape[0] // bs + 1):
+            x = self.x[i*bs : (i+1)*bs]
+            y = self.y[i*bs : (i+1)*bs]
+            if x.shape[0] != 0:
+                ret.append((x, y))
+        return ret
+
 
 if __name__ == "__main__":
     tf.set_random_seed(1234)
@@ -179,12 +190,13 @@ if __name__ == "__main__":
         dataset.load_cifar10(data_path, normalize=True, one_hot=True)
     _, n_xl, _, n_channels = x_train.shape
     n_y = y_train.shape[1]
-    n_sup = x_train.shape[0] // 2
+    n_sup = 4000
 
-    batch_size = 64
+    batch_size = 32 * FLAGS.num_gpus
     perm = np.random.permutation(x_train.shape[0])
-    b_sup = BatchGenerator(x_train[perm[:n_sup]], y_train[perm[:n_sup]], batch_size)
-    b_uns = BatchGenerator(x_train[perm[n_sup:]], y_train[perm[n_sup:]], batch_size)
+    b_sup  = BatchGenerator(x_train[perm[:n_sup]], y_train[perm[:n_sup]], batch_size)
+    b_uns  = BatchGenerator(x_train[perm[n_sup:]], y_train[perm[n_sup:]], batch_size)
+    b_test = BatchGenerator(x_test, y_test, batch_size)
 
     # Define model parameters
     n_z = 100
@@ -206,41 +218,65 @@ if __name__ == "__main__":
     y_real = tf.stack((zero, one), 1)
     y_fake = tf.stack((one, zero), 1)
     learning_rate_ph = tf.placeholder(tf.float32, shape=[], name='lr')
-    optimizer = tf.train.AdamOptimizer(learning_rate_ph)
+    optimizer = tf.train.AdamOptimizer(learning_rate_ph, beta1=0.5)
 
-    # build the losses
-    gen, x_gen = generator(None, batch_size, n_z, is_training)
-    _, eval_x_gen = generator(None, gen_size,   n_z, is_training)
-    x_sup_logits = classifier(x_sup_ph, n_y, is_training)
-    x_uns_logits = classifier(x_uns_ph, n_y, is_training)
-    x_gen_logits = classifier(x_gen, n_y, is_training)
-    def mult_to_bin(x_logits):
-        one_class = tf.reduce_logsumexp(x_logits, -1)
-        zero_class = tf.zeros_like(one_class)
-        bin_logits = tf.stack((zero_class, one_class), 1)
-        return bin_logits
+    def build_tower_graph(x_sup_ph, x_uns_ph, id_):
+        segment_size = tf.shape(x_sup_ph)[0] // FLAGS.num_gpus
+        def shard(x):
+            return x[id_*segment_size : (id_+1)*segment_size]
+        # build the losses
+        gen, x_gen = generator(None, segment_size, n_z, is_training)
+        x_sup_logits = classifier(shard(x_sup_ph), n_y, is_training)
+        x_uns_logits = classifier(shard(x_uns_ph), n_y, is_training)
+        x_gen_logits = classifier(x_gen, n_y, is_training)
+        def mult_to_bin(x_logits):
+            one_class = tf.reduce_logsumexp(x_logits, -1)
+            zero_class = tf.zeros_like(one_class)
+            bin_logits = tf.stack((zero_class, one_class), 1)
+            return bin_logits
 
-    # TODO label smoothing
-    x_uns_bin_logits = mult_to_bin(x_uns_logits)
-    x_gen_bin_logits = mult_to_bin(x_gen_logits)
-    loss_sup = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_ph,   logits=x_sup_logits))
-    loss_uns = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_real, logits=x_uns_bin_logits))
-    loss_gen = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_fake, logits=x_gen_bin_logits))
-    clf_loss = loss_sup + loss_uns + loss_gen
-    gen_loss = -loss_gen
+        accuracy = tf.nn.in_top_k(x_sup_logits, tf.argmax(shard(y_ph), 1), k=1)
+#accuracy = tf.Print(accuracy, [accuracy, tf.argmax(x_sup_logits, 1), tf.argmax(shard(y_ph), 1)])
+        accuracy = tf.reduce_sum(tf.cast(accuracy, tf.float32))
 
-    # optimizer ops
-    clf_var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
-                                     scope='classifier')
-    gen_var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
-                                     scope='generator')
-    clf_grads = optimizer.compute_gradients(clf_loss, var_list=clf_var_list)
-    gen_grads = optimizer.compute_gradients(gen_loss, var_list=gen_var_list)
-    grads = clf_grads + gen_grads
+        # TODO label smoothing
+        x_uns_bin_logits = mult_to_bin(x_uns_logits)
+        x_gen_bin_logits = mult_to_bin(x_gen_logits)
+        loss_sup = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=shard(y_ph),   logits=x_sup_logits))
+        loss_uns = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=shard(y_real), logits=x_uns_bin_logits))
+        loss_gen = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=shard(y_fake), logits=x_gen_bin_logits))
+        clf_loss = loss_sup + loss_uns + loss_gen
+        gen_loss = -loss_gen
+
+        # optimizer ops
+        clf_var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+                                         scope='classifier')
+        gen_var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
+                                         scope='generator')
+        clf_grads = optimizer.compute_gradients(clf_loss, var_list=clf_var_list)
+        gen_grads = optimizer.compute_gradients(gen_loss, var_list=gen_var_list)
+        grads = clf_grads + gen_grads
+        return grads, gen_loss, clf_loss, accuracy
+
+    tower_losses = []
+    tower_grads = []
+    for i in range(FLAGS.num_gpus):
+        with tf.device('/gpu:%d' % i):
+            with tf.name_scope('tower_%d' % i):
+                grads, gen_loss, clf_loss, accuracy = build_tower_graph(x_sup_ph, x_uns_ph, i)
+                tower_losses.append([gen_loss, clf_loss, accuracy])
+                tower_grads.append(grads)
+    gen_loss, clf_loss, accuracy = multi_gpu.average_losses(tower_losses)
+    accuracy *= FLAGS.num_gpus
+    grads = multi_gpu.average_gradients(tower_grads)
     train = optimizer.apply_gradients(grads)
+    _, eval_x_gen = generator(None, gen_size, n_z, is_training)
+
+    gen_var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,
+                                     scope='generator')
 
     # Run the inference
-    with tf.Session() as sess:
+    with multi_gpu.create_session() as sess:
         sess.run(tf.global_variables_initializer())
         for epoch in range(1, epoches + 1):
             time_train = -time.time()
@@ -253,21 +289,30 @@ if __name__ == "__main__":
                     feed_dict={x_sup_ph: xs, y_ph: ys, x_uns_ph: xu,
                                learning_rate_ph: learning_rate,
                                is_training: True})
-                print(g_loss, c_loss)
+#print(g_loss, c_loss)
                 gen_losses.append(g_loss)
                 clf_losses.append(c_loss)
-                if t % 50 == 0:
-                    print(t, time_train+time.time())
+                if t % 100 == 0:
+                    print(t, time_train+time.time(), np.mean(gen_losses), np.mean(clf_losses))
                     time_test = -time.time()
                     images = sess.run(eval_x_gen,
                                       feed_dict={is_training: False})
                     name = "results/improvedgan/improvedgan.epoch.{}.png".format(epoch)
                     save_image_collections(images, name, scale_each=True)
+
+                    # Test
+                    a = 0.0
+                    for xx, yy in b_test.batches():
+                        acc = sess.run(accuracy, 
+                                       feed_dict={x_sup_ph: xx, y_ph: yy, is_training: False})
+                        a += acc
+                    a /= x_test.shape[0]
                     time_test += time.time()
+                    print('Testing ({:.2f}s) accuracy = {}'.format(time_test, a))
 
             time_train += time.time()
             if True:
-                print('Epoch={} ({:.2f} s}): Gen loss = {} Clf loss = {}'.
+                print('Epoch={} ({:.2f} s): Gen loss = {} Clf loss = {}'.
                       format(epoch, time_train, 
                              np.mean(gen_losses), np.mean(clf_losses)))
 
